@@ -18,7 +18,7 @@
 </head>
 <body>
 <h1>A2U テスト送金ツール（使い切り）</h1>
-<p class="note">入力したキーはこの端末の中だけで使われ、どこにも送信されません（送金先は Pi のサーバーとテストネットだけ）。終わったらこのタブを閉じてください。</p>
+<p class="note">入力したキーはこの端末の中だけで使われ、どこにも送信されません（送金先は Pi のサーバーとテストネットだけ）。実行中はページを読み直さないでください。終わったらこのタブを閉じてください。</p>
 
 <label>アプリのAPIキー（Tsumu1 のもの）</label>
 <input type="password" id="apiKey" autocomplete="off">
@@ -62,7 +62,7 @@
     });
     const t = await r.text();
     let j; try { j = JSON.parse(t); } catch (e) { j = { raw: t }; }
-    if (!r.ok) throw new Error('API ' + r.status + ': ' + t.slice(0, 300));
+    if (!r.ok) { const err = new Error('API ' + r.status + ': ' + t.slice(0, 300)); err.body = j; throw err; }
     return j;
   }
   document.getElementById('run').addEventListener('click', async () => {
@@ -79,23 +79,48 @@
     catch (e) { log('シードの形式が違うようです: ' + e.message); btn.disabled = false; return; }
     log('送金元ウォレット: ' + kp.publicKey());
     const server = new StellarSdk.Horizon.Server(HORIZON);
+
+    async function submitAndComplete(identifier, recipient, amt) {
+      const acct = await server.loadAccount(kp.publicKey());
+      const fee = await server.fetchBaseFee();
+      const tx = new StellarSdk.TransactionBuilder(acct, { fee: String(fee), networkPassphrase: PASS })
+        .addOperation(StellarSdk.Operation.payment({ destination: recipient, asset: StellarSdk.Asset.native(), amount: String(amt) }))
+        .addMemo(StellarSdk.Memo.text(identifier))
+        .setTimeout(120).build();
+      tx.sign(kp);
+      const res = await server.submitTransaction(tx);
+      log('チェーンに送信: ' + res.hash.slice(0, 16) + '…');
+      await api('/payments/' + identifier + '/complete', { txid: res.hash }, key);
+    }
+    async function createFor(u) {
+      return api('/payments', { payment: { amount: parseFloat(amount), memo: 'Tsumu2 wallet test payment', metadata: { purpose: 'a2u_qualification' }, uid: u.uid } }, key);
+    }
+
+    const doneUids = new Set();
     for (const u of picked) {
+      if (doneUids.has(u.uid)) { log('--- ' + u.name + '（未完了分で完了済みのため省略）'); continue; }
       try {
         log('--- ' + u.name);
-        const pay = await api('/payments', { payment: { amount: parseFloat(amount), memo: 'Tsumu2 wallet test payment', metadata: { purpose: 'a2u_qualification' }, uid: u.uid } }, key);
+        let pay;
+        try {
+          pay = await createFor(u);
+        } catch (e) {
+          const p = e.body && e.body.payment;
+          if (e.body && e.body.error === 'ongoing_payment_found' && p && p.identifier) {
+            const rec = p.recipient || p.to_address;
+            log('未完了の支払いが残っていました（' + p.amount + ' Pi）。先にそちらを完了させます');
+            await submitAndComplete(p.identifier, rec, String(p.amount));
+            log('未完了分の完了OK');
+            if (p.user_uid) doneUids.add(p.user_uid);
+            if (doneUids.has(u.uid)) continue;
+            pay = await createFor(u);
+          } else { throw e; }
+        }
         const identifier = pay.identifier;
-        const recipient = pay.recipient;
-        log('送金を作成: ' + identifier.slice(0, 12) + '… → ' + recipient);
-        const acct = await server.loadAccount(kp.publicKey());
-        const fee = await server.fetchBaseFee();
-        const tx = new StellarSdk.TransactionBuilder(acct, { fee: String(fee), networkPassphrase: PASS })
-          .addOperation(StellarSdk.Operation.payment({ destination: recipient, asset: StellarSdk.Asset.native(), amount: String(amount) }))
-          .addMemo(StellarSdk.Memo.text(identifier))
-          .setTimeout(120).build();
-        tx.sign(kp);
-        const res = await server.submitTransaction(tx);
-        log('チェーンに送信: ' + res.hash.slice(0, 16) + '…');
-        const done = await api('/payments/' + identifier + '/complete', { txid: res.hash }, key);
+        const recipient = pay.recipient || pay.to_address;
+        log('送金を作成: ' + String(identifier).slice(0, 12) + '… → ' + recipient);
+        await submitAndComplete(identifier, recipient, amount);
+        doneUids.add(u.uid);
         log('完了: ' + u.name + ' ✅');
       } catch (e) {
         log('失敗（' + u.name + '）: ' + (e.message || e));
