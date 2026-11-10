@@ -80,15 +80,41 @@
     log('送金元ウォレット: ' + kp.publicKey());
     const server = new StellarSdk.Horizon.Server(HORIZON);
 
-    async function submitAndComplete(identifier, recipient, amt) {
+    async function ensureAccount(recipient) {
+      try { await server.loadAccount(recipient); return; }
+      catch (e) { if (!(e.response && e.response.status === 404)) throw e; }
+      log('相手のテストネット口座が無いので、先に口座を作ります');
       const acct = await server.loadAccount(kp.publicKey());
       const fee = await server.fetchBaseFee();
       const tx = new StellarSdk.TransactionBuilder(acct, { fee: String(fee), networkPassphrase: PASS })
-        .addOperation(StellarSdk.Operation.payment({ destination: recipient, asset: StellarSdk.Asset.native(), amount: String(amt) }))
-        .addMemo(StellarSdk.Memo.text(identifier))
+        .addOperation(StellarSdk.Operation.createAccount({ destination: recipient, startingBalance: '2' }))
         .setTimeout(120).build();
       tx.sign(kp);
-      const res = await server.submitTransaction(tx);
+      await server.submitTransaction(tx);
+      log('口座を作成しました');
+    }
+    async function submitTx(buildOps) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const acct = await server.loadAccount(kp.publicKey());
+        const fee = await server.fetchBaseFee();
+        const b = new StellarSdk.TransactionBuilder(acct, { fee: String(fee), networkPassphrase: PASS });
+        buildOps(b);
+        const tx = b.setTimeout(120).build();
+        tx.sign(kp);
+        try { return await server.submitTransaction(tx); }
+        catch (e) {
+          const codes = e.response && e.response.data && e.response.data.extras && e.response.data.extras.result_codes;
+          if (codes) throw new Error('チェーン側の拒否: ' + JSON.stringify(codes));
+          if (attempt === 0) { log('通信エラーのため再試行します'); await new Promise(r => setTimeout(r, 3000)); continue; }
+          throw e;
+        }
+      }
+    }
+    async function submitAndComplete(identifier, recipient, amt) {
+      await ensureAccount(recipient);
+      const res = await submitTx(b => b
+        .addOperation(StellarSdk.Operation.payment({ destination: recipient, asset: StellarSdk.Asset.native(), amount: String(amt) }))
+        .addMemo(StellarSdk.Memo.text(identifier)));
       log('チェーンに送信: ' + res.hash.slice(0, 16) + '…');
       await api('/payments/' + identifier + '/complete', { txid: res.hash }, key);
     }
