@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A2U テスト送金ツール（使い切り）</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; color: #223; background: #eef6ff; }
+  h1 { font-size: 19px; }
+  label { display: block; font-weight: 700; margin: 14px 0 4px; }
+  input[type="password"], input[type="text"] { width: 100%; padding: 10px; font-size: 15px; border: 1px solid #9db8cc; border-radius: 8px; box-sizing: border-box; }
+  .user { background: #fff; border: 1px solid #c6d8e8; border-radius: 10px; padding: 8px 12px; margin: 6px 0; }
+  button { font: inherit; font-weight: 800; font-size: 17px; color: #fff; background: #1e88e5; border: none; border-radius: 999px; padding: 12px 34px; margin-top: 16px; }
+  button:disabled { background: #a9c3d4; }
+  #log { white-space: pre-wrap; background: #10222e; color: #cfe8ff; border-radius: 10px; padding: 12px; margin-top: 16px; font-size: 13px; min-height: 60px; }
+  .note { font-size: 13px; color: #476; }
+</style>
+</head>
+<body>
+<h1>A2U テスト送金ツール（使い切り）</h1>
+<p class="note">入力したキーはこの端末の中だけで使われ、どこにも送信されません（送金先は Pi のサーバーとテストネットだけ）。終わったらこのタブを閉じてください。</p>
+
+<label>アプリのAPIキー（Tsumu1 のもの）</label>
+<input type="password" id="apiKey" autocomplete="off">
+
+<label>テストネット用アプリウォレットの秘密の言葉（シード）</label>
+<input type="password" id="seed" autocomplete="off">
+
+<label>送る相手（サインイン済みのユーザー）</label>
+<div id="users">読み込み中…</div>
+
+<label>1人あたりの金額（テストPi）</label>
+<input type="text" id="amount" value="0.1" inputmode="decimal">
+
+<button id="run">チェックした相手に送る</button>
+<div id="log"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@stellar/stellar-sdk@12.3.0/dist/stellar-sdk.min.js"></script>
+<script>
+  const FB = 'https://firestore.googleapis.com/v1/projects/moco-othello-6e5c4/databases/(default)/documents/tsumUsers?pageSize=100';
+  const usersEl = document.getElementById('users');
+  const logEl = document.getElementById('log');
+  function log(m) { logEl.textContent += m + '\n'; }
+  let users = [];
+  fetch(FB).then(r => r.json()).then(d => {
+    users = (d.documents || []).map(doc => ({
+      uid: doc.name.split('/').pop().replace(/^pi:/, ''),
+      name: (doc.fields && doc.fields.name && doc.fields.name.stringValue) || '?'
+    }));
+    usersEl.innerHTML = users.map((u, i) =>
+      '<label class="user"><input type="checkbox" data-i="' + i + '" checked> ' +
+      u.name + '（' + u.uid.slice(0, 8) + '…）</label>').join('') || 'ユーザーがいません';
+  }).catch(e => { usersEl.textContent = 'ユーザー一覧の読み込みに失敗: ' + e; });
+
+  const HORIZON = 'https://api.testnet.minepi.com';
+  const PASS = 'Pi Testnet';
+  async function api(path, body, key) {
+    const r = await fetch('https://api.minepi.com/v2' + path, {
+      method: 'POST',
+      headers: { 'Authorization': 'Key ' + key, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const t = await r.text();
+    let j; try { j = JSON.parse(t); } catch (e) { j = { raw: t }; }
+    if (!r.ok) throw new Error('API ' + r.status + ': ' + t.slice(0, 300));
+    return j;
+  }
+  document.getElementById('run').addEventListener('click', async () => {
+    const key = document.getElementById('apiKey').value.trim();
+    const seed = document.getElementById('seed').value.trim();
+    const amount = document.getElementById('amount').value.trim();
+    const picked = [...document.querySelectorAll('#users input:checked')].map(c => users[+c.dataset.i]);
+    logEl.textContent = '';
+    if (!key || !seed) { log('APIキーとシードを入れてください'); return; }
+    if (!picked.length) { log('相手を選んでください'); return; }
+    const btn = document.getElementById('run'); btn.disabled = true;
+    let kp;
+    try { kp = StellarSdk.Keypair.fromSecret(seed); }
+    catch (e) { log('シードの形式が違うようです: ' + e.message); btn.disabled = false; return; }
+    log('送金元ウォレット: ' + kp.publicKey());
+    const server = new StellarSdk.Horizon.Server(HORIZON);
+    for (const u of picked) {
+      try {
+        log('--- ' + u.name);
+        const pay = await api('/payments', { payment: { amount: parseFloat(amount), memo: 'Tsumu2 wallet test payment', metadata: { purpose: 'a2u_qualification' }, uid: u.uid } }, key);
+        const identifier = pay.identifier;
+        const recipient = pay.recipient;
+        log('送金を作成: ' + identifier.slice(0, 12) + '… → ' + recipient);
+        const acct = await server.loadAccount(kp.publicKey());
+        const fee = await server.fetchBaseFee();
+        const tx = new StellarSdk.TransactionBuilder(acct, { fee: String(fee), networkPassphrase: PASS })
+          .addOperation(StellarSdk.Operation.payment({ destination: recipient, asset: StellarSdk.Asset.native(), amount: String(amount) }))
+          .addMemo(StellarSdk.Memo.text(identifier))
+          .setTimeout(120).build();
+        tx.sign(kp);
+        const res = await server.submitTransaction(tx);
+        log('チェーンに送信: ' + res.hash.slice(0, 16) + '…');
+        const done = await api('/payments/' + identifier + '/complete', { txid: res.hash }, key);
+        log('完了: ' + u.name + ' ✅');
+      } catch (e) {
+        log('失敗（' + u.name + '）: ' + (e.message || e));
+      }
+    }
+    log('全部終わりました');
+    btn.disabled = false;
+  });
+</script>
+</body>
+</html>
